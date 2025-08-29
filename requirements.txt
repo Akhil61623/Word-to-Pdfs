@@ -1,11 +1,5 @@
 Flask==2.3.3
 gunicorn==23.0.0
-mammoth==1.7.1
-xhtml2pdf==0.2.15
-pymupdf==1.26.4
 razorpay==1.4.2
-Pillow==11.3.0
-setuptools>=65.0.0
-Flask==2.3.3
-gunicorn==23.0.0
-pymupdf==1.26.4   # (optional) पेज काउंट/वैलिडेशन के लिए
+setuptools>=68.0.0
+pypdf==6.0.0
