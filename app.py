@@ -1,154 +1,165 @@
-import os, tempfile, shutil, zipfile, subprocess, secrets, time
-from threading import Timer
-from datetime import datetime, timedelta
+import io
+import os
+import json
+import hmac
+import base64
+import hashlib
+import tempfile
+from datetime import datetime
+from typing import List, Tuple
 
-from flask import Flask, request, send_file, render_template_string, jsonify, after_this_request
+from flask import Flask, request, render_template_string, send_file, jsonify, after_this_request
 from werkzeug.utils import secure_filename
 
-# Razorpay (server-side)
-import razorpay
-
-# PDF page counting (no heavy deps)
-from pypdf import PdfReader
+import requests           # Razorpay Orders API (SDK नहीं)
+import mammoth            # DOCX -> HTML
+from xhtml2pdf import pisa  # HTML -> PDF
+import fitz               # PyMuPDF (PDF page count के लिए)
 
 app = Flask(__name__)
 
-# -------- Business Rules --------
-FREE_MAX_PAGES = 25          # प्रति फ़ाइल
-FREE_MAX_MB = 10             # प्रति फ़ाइल
-FREE_MAX_FILES = 2           # एक बार में
-PAID_AMOUNT_RUPEES = 10      # ₹10
-PAID_AMOUNT_PAISE = PAID_AMOUNT_RUPEES * 100
+# ====== Config ======
+FREE_MAX_FILES = 2
+FREE_MAX_MB = 10
+FREE_MAX_PAGES = 25
+PAID_AMOUNT_INR = 10
+RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "")
+RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
 
-# Limits & security
-app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # कुल रिक्वेस्ट 50MB
-ALLOWED_EXTS = {".doc", ".docx", ".odt", ".rtf"}
+# Razorpay in-memory “paid orders” store (सरल डेमो के लिए)
+PAID_ORDERS = set()
 
-# Razorpay keys from ENV
-RZP_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
-RZP_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
-RZP_ENABLED = bool(RZP_KEY_ID and RZP_KEY_SECRET)
-
-# Razorpay client
-client = razorpay.Client(auth=(RZP_KEY_ID, RZP_KEY_SECRET)) if RZP_ENABLED else None
-
-# In-memory store: order_id/token -> session info
-SESSION_STORE = {}   # token -> {"dir": str, "files": [pdfpaths], "created": ts}
-ORDER_MAP = {}       # order_id -> token
-
-# ---------- UI ----------
+# ====== HTML (Jinja-safe) ======
 INDEX_HTML = r"""
+{% raw %}
 <!doctype html>
 <html lang="hi">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Mahamaya Stationery — Word → PDF Converter</title>
-<link rel="preconnect" href="https://checkout.razorpay.com">
 <style>
-  :root{ --bg:#0b1220; --fg:#e7eaf1; --muted:#93a2bd; --card:#10182b; --stroke:#203054; --accent:#22c55e; --brand:#4f8cff; --warn:#f59e0b; --danger:#ef4444; }
-  *{box-sizing:border-box} body{margin:0; background:var(--bg); color:var(--fg); font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}
-  .wrap{min-height:100svh; display:grid; place-items:center; padding:20px}
-  .card{width:min(920px,100%); background:linear-gradient(180deg,#0f172a 0,#0b1220 100%); border:1px solid var(--stroke); border-radius:20px; padding:24px; box-shadow:0 10px 40px rgba(0,0,0,.35)}
-  .top{display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap}
-  .brand{display:flex; gap:10px; align-items:center; font-weight:800}
-  .brand-badge{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,var(--brand), var(--accent))}
-  h1{margin:12px 0 6px; font-size:24px}
-  p.muted{margin:0 0 14px; color:var(--muted)}
-  .drop{border:2px dashed var(--stroke); background:#0d162a; border-radius:16px; padding:18px; text-align:center}
-  .drop.drag{border-color:var(--brand); background:#10203f}
-  .note{color:var(--muted); font-size:12px}
-  input[type="file"]{display:none}
-  .row{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
-  button.btn{padding:10px 14px; border-radius:12px; border:1px solid var(--stroke); background:var(--brand); color:#fff; font-weight:700; cursor:pointer}
-  button.ghost{background:#17233f}
-  button:disabled{opacity:.6; cursor:not-allowed}
-  .alert{margin-top:10px; padding:10px 12px; border-radius:12px; display:none; font-weight:600}
-  .ok{background:rgba(34,197,94,.1); color:#22c55e; border:1px solid rgba(34,197,94,.25)}
-  .err{background:rgba(239,68,68,.1); color:#ef4444; border:1px solid rgba(239,68,68,.25)}
-  .warn{background:rgba(245,158,11,.1); color:#f59e0b; border:1px solid rgba(245,158,11,.25)}
-  .filelist{margin-top:8px; font-size:13px; line-height:1.4}
-  .grid{display:grid; grid-template-columns: 1fr 1fr; gap:12px}
-  @media (max-width:720px){ .grid{grid-template-columns:1fr} }
-  /* Loading overlay */
-  .overlay{position:fixed; inset:0; background:rgba(4,8,18,.6); display:none; place-items:center; z-index:50}
-  .panel{background:#0f172a; border:1px solid var(--stroke); border-radius:16px; padding:18px; width:min(420px,90%)}
-  .loader{width:48px;height:48px; border-radius:50%; border:6px solid rgba(255,255,255,.1); border-top-color:#fff; animation:spin 1s linear infinite; margin:12px auto}
-  @keyframes spin {to { transform: rotate(360deg);}}
-  .tip{font-size:12px; color:var(--muted)}
+:root{
+  --bg:#0b1220; --fg:#e7eaf1; --muted:#93a2bd; --card:#10182b;
+  --accent:#4f8cff; --acc2:#22c55e; --warn:#f59e0b; --danger:#ef4444; --stroke:#223052;
+}
+*{box-sizing:border-box}
+body{margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; background:var(--bg); color:var(--fg)}
+.wrap{min-height:100svh; display:grid; place-items:center; padding:20px}
+.card{width:min(950px,100%); background:linear-gradient(180deg,#0f172a,#0b1220);
+  border:1px solid var(--stroke); border-radius:18px; padding:20px; box-shadow:0 10px 30px rgba(0,0,0,.35)}
+.header{display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap}
+.brand{display:flex; align-items:center; gap:10px; font-weight:900}
+.brand-badge{width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,#4f8cff,#22c55e)}
+h1{font-size:22px; margin:8px 0}
+p.muted{color:var(--muted); margin:0 0 10px}
+
+.drop{border:2px dashed var(--stroke); background:#0f1830; border-radius:16px; padding:16px; text-align:center}
+.drop.drag{border-color:var(--accent); background:#0f2146}
+.note{font-size:12px; color:var(--muted)}
+.row{display:flex; align-items:center; gap:8px; flex-wrap:wrap}
+
+.btn{display:inline-flex; align-items:center; gap:8px; padding:10px 14px; border-radius:12px;
+  border:1px solid var(--stroke); background:var(--accent); color:#fff; font-weight:700; cursor:pointer}
+.btn.ghost{background:#17243f}
+.btn.warn{background:var(--warn); color:#111}
+.btn.ok{background:var(--acc2)}
+.btn:disabled{opacity:.6; cursor:not-allowed}
+.badge{font-size:12px; padding:2px 8px; border:1px solid var(--stroke); border-radius:999px; color:var(--muted)}
+
+.alert{display:none; margin-top:8px; padding:10px 12px; border-radius:12px; font-weight:600}
+.alert.ok{background:rgba(34,197,94,.08); color:var(--acc2); border:1px solid rgba(34,197,94,.25)}
+.alert.err{background:rgba(239,68,68,.08); color:var(--danger); border:1px solid rgba(239,68,68,.25)}
+.alert.warn{background:rgba(245,158,11,.08); color:var(--warn); border:1px solid rgba(245,158,11,.25)}
+
+.loader{
+  --s: 60px;
+  width:var(--s); height:var(--s); border-radius:50%;
+  border:6px solid rgba(255,255,255,.15); border-top-color:#fff;
+  animation:spin 1s linear infinite; margin-left:6px
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+.progress{display:none; align-items:center; gap:10px; margin-top:8px}
+
+small.tos{display:block; margin-top:10px; color:#8aa0c7}
+ul{margin:6px 0 0 18px; color:#cdd7ee; font-size:14px}
+li{margin:2px 0}
 </style>
 </head>
 <body>
 <div class="wrap">
   <div class="card">
-    <div class="top">
-      <div class="brand"><div class="brand-badge"></div><div>Mahamaya Stationery</div></div>
-      <div class="note">Word (.doc/.docx) → PDF • फॉर्मैटिंग Safe</div>
+    <div class="header">
+      <div class="brand">
+        <div class="brand-badge"></div>
+        <div>Mahamaya Stationery</div>
+      </div>
+      <div class="badge">Word (.docx) → PDF</div>
     </div>
 
-    <h1>Word → PDF (Free ≤ 25 pages or 10 MB; ≤ 2 files)</h1>
-    <p class="muted">सीमाओं से ऊपर होने पर Razorpay से ₹10 लगेगा।</p>
+    <h1>Word → PDF (Free ≤ 2 files · 10 MB · 25 pages; ऊपर ₹10)</h1>
+    <p class="muted">DOCX चुनें; हम HTML→PDF में convert करते हैं ताकि LibreOffice की ज़रूरत न पड़े। Images/tables/text styles सपोर्टेड हैं।</p>
 
-    <div id="drop" class="drop">
-      <b>Drag & Drop files here</b> <span class="note">या क्लिक करें</span>
-      <input id="files" type="file" accept=".doc,.docx,.odt,.rtf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document" multiple>
-      <div id="chosen" class="filelist note"></div>
+    <div id="drop" class="drop" tabindex="0">
+      <strong>Drag & Drop</strong> <span class="note">या क्लिक करके DOCX चुनें</span>
+      <input id="file" type="file" accept=".docx" multiple style="display:none" />
+      <div id="chosen" class="note" style="margin-top:8px"></div>
     </div>
 
-    <div style="height:12px"></div>
+    <div style="height:10px"></div>
 
     <div class="row">
-      <button id="convertBtn" class="btn">Convert</button>
-      <button id="chooseBtn" class="btn ghost">Choose Files</button>
-      <div id="status" class="note"></div>
+      <button class="btn" id="choose">Choose Files</button>
+      <button class="btn ghost" id="convert">Convert to PDF</button>
+      <div id="limits" class="badge">Free: ≤2 files, ≤10 MB, ≤25 pages</div>
     </div>
 
-    <div id="ok" class="alert ok"></div>
+    <div class="progress" id="progress">
+      <div class="loader"></div>
+      <div class="note" id="ptext">Converting… please wait</div>
+    </div>
+
+    <div id="ok" class="alert ok">Done! Download will start.</div>
     <div id="warn" class="alert warn"></div>
     <div id="err" class="alert err"></div>
 
-    <div class="note" style="margin-top:10px">
-      टिप्स: पासवर्ड-प्रोटेक्टेड Word फाइल सपोर्टेड नहीं। बड़ी फाइलों पर 10–20 सेकंड लग सकते हैं।
-    </div>
+    <small class="tos">
+      नोट: Pure-Python कन्वर्ज़न हर layout को 100% नहीं दोहराता, लेकिन सामान्य use-cases (text + images + tables) अच्छे से चलते हैं।
+    </small>
+
+    <ul>
+      <li>Free: कुल 2 फ़ाइलें, 10 MB और 25 pages तक।</li>
+      <li>ऊपर जाएँ तो Razorpay से ₹10 पेमेंट; उसके बाद convert अनलॉक।</li>
+    </ul>
   </div>
 </div>
 
-<!-- Overlay -->
-<div id="overlay" class="overlay">
-  <div class="panel">
-    <div class="loader"></div>
-    <div style="text-align:center; font-weight:700; margin-bottom:6px" id="overlayTitle">Processing…</div>
-    <div class="tip" id="overlayTip">हम आपकी फाइलों का विश्लेषण कर रहे हैं। पेज गिनती और साइज चेक…</div>
-  </div>
-</div>
-
-<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
 <script>
+const fileInput = document.getElementById('file');
 const drop = document.getElementById('drop');
-const filesEl = document.getElementById('files');
-const chooseBtn = document.getElementById('chooseBtn');
-const convertBtn = document.getElementById('convertBtn');
+const choose = document.getElementById('choose');
+const convertBtn = document.getElementById('convert');
 const chosen = document.getElementById('chosen');
 const ok = document.getElementById('ok');
 const warn = document.getElementById('warn');
 const err = document.getElementById('err');
-const statusEl = document.getElementById('status');
-const overlay = document.getElementById('overlay');
-const overlayTitle = document.getElementById('overlayTitle');
-const overlayTip = document.getElementById('overlayTip');
+const progress = document.getElementById('progress');
+const ptext = document.getElementById('ptext');
 
-let selected = [];
+let paidOrder = null;
 
-function show(div,msg){ div.textContent = msg; div.style.display = 'block'; }
-function hideAll(){ [ok,warn,err].forEach(d=>d.style.display='none'); statusEl.textContent=''; }
-function setOverlay(on, title, tip){
-  overlay.style.display = on ? 'grid' : 'none';
-  if(title) overlayTitle.textContent = title;
-  if(tip) overlayTip.textContent = tip;
+function show(el, msg){ el.textContent = msg; el.style.display='block'; }
+function hide(el){ el.style.display='none'; }
+
+function resetAlerts(){
+  hide(ok); hide(warn); hide(err);
 }
 
-drop.addEventListener('click', ()=> filesEl.click());
-chooseBtn.addEventListener('click', ()=> filesEl.click());
+function fmtMB(bytes){ return (bytes/1024/1024).toFixed(2) + ' MB'; }
+
+drop.addEventListener('click', ()=> fileInput.click());
+choose.addEventListener('click', ()=> fileInput.click());
+
 ['dragenter','dragover'].forEach(ev=>{
   drop.addEventListener(ev, e=>{ e.preventDefault(); drop.classList.add('drag'); });
 });
@@ -157,303 +168,308 @@ chooseBtn.addEventListener('click', ()=> filesEl.click());
 });
 drop.addEventListener('drop', e=>{
   e.preventDefault();
-  const flist = Array.from(e.dataTransfer.files || []);
-  applyFiles(flist);
+  if (e.dataTransfer.files?.length){
+    fileInput.files = e.dataTransfer.files;
+    listChosen();
+  }
 });
-filesEl.addEventListener('change', ()=>{
-  applyFiles(Array.from(filesEl.files || []));
-});
+fileInput.addEventListener('change', listChosen);
 
-function applyFiles(list){
-  hideAll();
-  selected = list.filter(f=>/\.(docx?|odt|rtf)$/i.test(f.name));
-  if(!selected.length){ show(err,"कृपया Word (.doc/.docx) फाइलें चुनें।"); chosen.textContent=""; return; }
-  chosen.innerHTML = selected.map(f=>`• ${f.name} · ${(f.size/1024/1024).toFixed(2)} MB`).join('<br>');
+function listChosen(){
+  resetAlerts();
+  if(!fileInput.files.length){ chosen.textContent = ''; return; }
+  let total = 0, names=[];
+  [...fileInput.files].forEach(f=>{ total += f.size; names.push(f.name); });
+  chosen.textContent = `Selected: ${names.join(', ')} · Total ${fmtMB(total)}`;
+}
+
+async function createOrder(){
+  const res = await fetch('/create_order', {method:'POST'});
+  if(!res.ok) throw new Error(await res.text());
+  return await res.json(); // {order_id, amount, key_id, currency}
+}
+
+function openRazorpay({order_id, amount, key_id, currency}){
+  return new Promise((resolve,reject)=>{
+    const s = document.createElement('script');
+    s.src = 'https://checkout.razorpay.com/v1/checkout.js';
+    s.onload = ()=>{
+      const rzp = new window.Razorpay({
+        key: key_id,
+        amount: amount,
+        currency: currency,
+        name: "Mahamaya Stationery",
+        description: "Word→PDF unlock",
+        order_id: order_id,
+        handler: function (resp) {
+          // verify on server
+          fetch('/verify_payment', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({
+              razorpay_order_id: resp.razorpay_order_id,
+              razorpay_payment_id: resp.razorpay_payment_id,
+              razorpay_signature: resp.razorpay_signature
+            })
+          }).then(r=>r.json()).then(js=>{
+            if(js.ok){
+              paidOrder = resp.razorpay_order_id;
+              resolve(true);
+            }else{
+              reject(new Error(js.error || 'Verification failed'));
+            }
+          }).catch(reject);
+        },
+        theme: { color: "#4f8cff" }
+      });
+      rzp.open();
+    };
+    s.onerror = ()=>reject(new Error('Razorpay load failed'));
+    document.body.appendChild(s);
+  });
 }
 
 convertBtn.addEventListener('click', async ()=>{
-  hideAll();
-  if(!selected.length){ show(err,"पहले Word फाइलें चुनें।"); return; }
+  resetAlerts();
+  if(!fileInput.files.length) { show(err, "पहले DOCX फाइलें चुनें."); return; }
+
+  // Build FormData
+  const fd = new FormData();
+  [...fileInput.files].forEach(f=> fd.append('files', f));
+  if (paidOrder) fd.append('paid_order', paidOrder);
+
   try{
-    setOverlay(true,"Analyzing…","पेज और साइज चेक, फिर कन्वर्ज़न/पेमेंट फ़्लो।");
+    progress.style.display='flex';
+    ptext.textContent = "Converting… please wait";
     convertBtn.disabled = true;
 
-    const fd = new FormData();
-    selected.forEach(f=>fd.append('files', f));
-
-    const res = await fetch('/precheck', { method:'POST', body:fd });
-    if(!res.ok){ throw new Error(await res.text()); }
-    const data = await res.json();
-
-    if(data.error){ throw new Error(data.error); }
-
-    if(!data.payment_required){
-      setOverlay(true,"Converting…","PDF तैयार हो रहे हैं।");
-      window.location.href = `/download/${data.token}`;
-      return;
+    let res = await fetch('/convert', { method:'POST', body: fd });
+    if(res.status === 402){
+      // needs payment
+      const data = await res.json(); // {error, reason}
+      show(warn, (data.error || "Payment required") + " — ₹10 लगेगा।");
+      ptext.textContent = "Waiting for payment…";
+      const ord = await createOrder();
+      await openRazorpay(ord);
+      // retry convert after payment
+      const fd2 = new FormData();
+      [...fileInput.files].forEach(f=> fd2.append('files', f));
+      fd2.append('paid_order', paidOrder);
+      res = await fetch('/convert', { method:'POST', body: fd2 });
     }
 
-    // Payment needed
-    const options = {
-      key: data.key_id,
-      amount: data.amount_paise,
-      currency: "INR",
-      name: "Mahamaya Stationery",
-      description: data.message || "Word → PDF conversion",
-      order_id: data.order_id,
-      handler: async function (rsp) {
-        // verify on server
-        setOverlay(true,"Verifying Payment…","कृपया इंतज़ार करें, पेमेंट वेरीफाई हो रहा है।");
-        const vr = await fetch('/verify', {
-          method:'POST',
-          headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({
-            token: data.token,
-            razorpay_order_id: rsp.razorpay_order_id,
-            razorpay_payment_id: rsp.razorpay_payment_id,
-            razorpay_signature: rsp.razorpay_signature
-          })
-        });
-        if(!vr.ok){ show(err, await vr.text()); setOverlay(false); return; }
-        const vj = await vr.json();
-        if(vj.ok && vj.download_url){
-          window.location.href = vj.download_url;
-        }else{
-          show(err, vj.error || "Verification failed.");
-          setOverlay(false);
-        }
-      },
-      theme:{ color:"#4f8cff" },
-      modal: {
-        ondismiss: function(){ setOverlay(false); show(warn,"पेमेंट रद्द कर दिया गया।"); }
-      },
-      prefill: {}
-    };
-
-    const rz = new Razorpay(options);
-    setOverlay(false);
-    rz.open();
+    if(!res.ok){
+      const t = await res.text();
+      throw new Error(t || ('HTTP '+res.status));
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'converted.zip';
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    show(ok, "हो गया! डाउनलोड शुरू हो गया।");
   }catch(e){
-    show(err, e.message || "Server error");
-    setOverlay(false);
+    show(err, e.message || "Conversion failed");
   }finally{
+    progress.style.display='none';
     convertBtn.disabled = false;
   }
 });
 </script>
 </body>
 </html>
+{% endraw %}
 """
 
-# ---------- Helpers ----------
-def is_allowed(filename: str) -> bool:
-    ext = os.path.splitext(filename or "")[1].lower()
-    return ext in ALLOWED_EXTS
+# ====== Helpers ======
 
-def mb(nbytes: int) -> float:
-    return nbytes / 1024.0 / 1024.0
+def bytes_to_mb(n: int) -> float:
+    return n / (1024.0 * 1024.0)
 
-def run_soffice_to_pdf(src_path: str, out_dir: str):
+def docx_to_html_bytes(docx_path: str) -> bytes:
     """
-    Use LibreOffice headless to convert Word -> PDF
+    DOCX -> HTML (images inline data URIs) using mammoth.
     """
-    cmd = [
-        "soffice", "--headless",
-        "--convert-to", "pdf",
-        "--outdir", out_dir,
-        src_path
-    ]
-    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if r.returncode != 0:
-        raise RuntimeError("LibreOffice conversion failed (maybe password-protected).")
-    base = os.path.splitext(os.path.basename(src_path))[0]
-    pdf_path = os.path.join(out_dir, base + ".pdf")
-    if not os.path.exists(pdf_path):
-        raise RuntimeError("PDF output missing (conversion error).")
-    return pdf_path
+    with open(docx_path, "rb") as f:
+        res = mammoth.convert_to_html(
+            f,
+            convert_image=mammoth.images.inline(
+                mammoth.images.img_element(lambda image: {"src": image.read("base64")})
+            )
+        )
+        html = res.value  # HTML string
+    # Basic CSS to keep structure readable
+    style = """
+    <style>
+      body{font-family: DejaVu Sans, Arial, sans-serif; font-size:11pt}
+      h1,h2,h3{margin:8px 0}
+      p{margin:6px 0}
+      table{border-collapse:collapse; width:100%}
+      td,th{border:1px solid #888; padding:4px; vertical-align:top}
+      img{max-width:100%}
+    </style>
+    """
+    return (style + html).encode("utf-8")
 
-def pdf_page_count(pdf_path: str) -> int:
-    with open(pdf_path, "rb") as f:
-        reader = PdfReader(f)
-        return len(reader.pages)
+def html_to_pdf_bytes(html_bytes: bytes) -> bytes:
+    """
+    HTML -> PDF using xhtml2pdf (pisa). Returns PDF bytes.
+    """
+    src = io.BytesIO(html_bytes)
+    out = io.BytesIO()
+    pisa.CreatePDF(src, dest=out, encoding='utf-8')
+    return out.getvalue()
 
-def make_zip(pdf_paths, zip_path):
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for p in pdf_paths:
-            arc = os.path.basename(p)
-            zf.write(p, arc)
+def count_pdf_pages(pdf_bytes: bytes) -> int:
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        return doc.page_count
 
-def cleanup_later(tmpdir: str, seconds: float = 120.0):
-    Timer(seconds, shutil.rmtree, args=[tmpdir], kwargs={"ignore_errors": True}).start()
+def enforce_free_limits(num_files: int, total_mb: float, total_pages: int, paid_order: str|None) -> Tuple[bool,str]:
+    if paid_order and paid_order in PAID_ORDERS:
+        return True, ""
+    if num_files > FREE_MAX_FILES:
+        return False, f"Free limit: max {FREE_MAX_FILES} files"
+    if total_mb > FREE_MAX_MB:
+        return False, f"Free limit: max {FREE_MAX_MB} MB"
+    if total_pages > FREE_MAX_PAGES:
+        return False, f"Free limit: max {FREE_MAX_PAGES} pages"
+    return True, ""
 
-# ---------- Routes ----------
+def make_zip(files: List[Tuple[str, bytes]]) -> bytes:
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in files:
+            zf.writestr(name, data)
+    buf.seek(0)
+    return buf.getvalue()
+
+# ====== Routes ======
+
 @app.route("/")
-def index():
+def home():
     return render_template_string(INDEX_HTML)
 
 @app.route("/healthz")
-def healthz():
-    return "OK", 200
+def health():
+    return "OK"
 
-@app.route("/precheck", methods=["POST"])
-def precheck():
-    # Save uploads
+@app.route("/create_order", methods=["POST"])
+def create_order():
+    """
+    Create a Razorpay order for ₹10 using REST API (no SDK).
+    """
+    if not (RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET):
+        return jsonify({"error":"Razorpay keys not configured"}), 500
+    amount = PAID_AMOUNT_INR * 100  # paise
+    data = {
+        "amount": amount,
+        "currency": "INR",
+        "receipt": f"mm-w2p-{int(datetime.utcnow().timestamp())}",
+        "payment_capture": 1
+    }
+    resp = requests.post(
+        "https://api.razorpay.com/v1/orders",
+        auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
+        headers={"Content-Type":"application/json"},
+        data=json.dumps(data),
+        timeout=30
+    )
+    if resp.status_code >= 300:
+        return jsonify({"error": f"order_failed {resp.text}"}), 500
+    rj = resp.json()
+    return jsonify({
+        "order_id": rj["id"],
+        "amount": rj["amount"],
+        "currency": rj["currency"],
+        "key_id": RAZORPAY_KEY_ID
+    })
+
+@app.route("/verify_payment", methods=["POST"])
+def verify_payment():
+    """
+    Verify Razorpay signature without SDK.
+    """
+    try:
+        body = request.get_json(force=True)
+        oid = body["razorpay_order_id"]
+        pid = body["razorpay_payment_id"]
+        sig = body["razorpay_signature"]
+    except Exception:
+        return jsonify({"ok": False, "error":"bad request"}), 400
+
+    if not (RAZORPAY_KEY_SECRET and oid and pid and sig):
+        return jsonify({"ok": False, "error":"missing"}), 400
+
+    message = f"{oid}|{pid}".encode()
+    digest = hmac.new(RAZORPAY_KEY_SECRET.encode(), msg=message, digestmod=hashlib.sha256).hexdigest()
+    if hmac.compare_digest(digest, sig):
+        PAID_ORDERS.add(oid)
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error":"invalid signature"}), 400
+
+@app.route("/convert", methods=["POST"])
+def convert():
+    """
+    Accept multiple DOCX files, convert each to PDF, enforce free limits, return ZIP.
+    """
     files = request.files.getlist("files")
     if not files:
-        return jsonify(error="No files uploaded."), 400
-    if len(files) > 10:
-        return jsonify(error="Too many files (max 10 at once)."), 400
+        return "No files", 400
 
+    paid_order = request.form.get("paid_order") or None
+
+    # basic size check
+    total_bytes = 0
+    saved_paths = []
     tmpdir = tempfile.mkdtemp(prefix="w2p_")
-    srcdir = os.path.join(tmpdir, "src")
-    pdfdir = os.path.join(tmpdir, "pdf")
-    os.makedirs(srcdir, exist_ok=True)
-    os.makedirs(pdfdir, exist_ok=True)
-
-    saved = []
-    reasons = []
-    try:
-        for f in files:
-            fname = secure_filename(f.filename or "")
-            if not fname or not is_allowed(fname):
-                raise ValueError("Only .doc/.docx/.odt/.rtf files are allowed.")
-            path = os.path.join(srcdir, fname)
-            f.save(path)
-            size_b = os.path.getsize(path)
-            saved.append((path, size_b))
-
-        # Convert all to PDF & evaluate
-        pdf_paths = []
-        need_payment = False
-
-        for path, size_b in saved:
-            # size rule
-            if mb(size_b) > FREE_MAX_MB:
-                reasons.append(f"{os.path.basename(path)} > {FREE_MAX_MB}MB")
-                need_payment = True
-
-            # convert & page count
-            try:
-                pdf_path = run_soffice_to_pdf(path, pdfdir)
-            except Exception as e:
-                shutil.rmtree(tmpdir, ignore_errors=True)
-                return jsonify(error=str(e)), 400
-
-            pdf_paths.append(pdf_path)
-            try:
-                pages = pdf_page_count(pdf_path)
-            except Exception:
-                pages = 0
-            if pages > FREE_MAX_PAGES:
-                reasons.append(f"{os.path.basename(path)} has {pages} pages (> {FREE_MAX_PAGES})")
-                need_payment = True
-
-        # file-count rule
-        if len(saved) > FREE_MAX_FILES:
-            reasons.append(f"More than {FREE_MAX_FILES} files in one go")
-            need_payment = True
-
-        # Store session
-        token = secrets.token_urlsafe(16)
-        SESSION_STORE[token] = {
-            "dir": tmpdir,
-            "files": pdf_paths,
-            "created": time.time()
-        }
-
-        if not need_payment or not RZP_ENABLED:
-            # Free OR Razorpay not configured => allow free
-            return jsonify(payment_required=False, token=token)
-
-        # Create Razorpay order
-        receipt = f"w2p_{token}"
-        order = client.order.create(dict(
-            amount=PAID_AMOUNT_PAISE,
-            currency="INR",
-            receipt=receipt,
-            payment_capture=1
-        ))
-        order_id = order["id"]
-        ORDER_MAP[order_id] = token
-
-        msg = "Payment required (₹10)"
-        if reasons:
-            msg += ": " + "; ".join(reasons)
-
-        return jsonify(
-            payment_required=True,
-            amount_rupees=PAID_AMOUNT_RUPEES,
-            amount_paise=PAID_AMOUNT_PAISE,
-            key_id=RZP_KEY_ID,
-            order_id=order_id,
-            token=token,
-            message=msg
-        )
-    except Exception as e:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        return jsonify(error=str(e)), 500
-
-@app.route("/verify", methods=["POST"])
-def verify():
-    data = request.get_json(silent=True) or {}
-    token = data.get("token")
-    order_id = data.get("razorpay_order_id")
-    payment_id = data.get("razorpay_payment_id")
-    signature = data.get("razorpay_signature")
-
-    if not (token and order_id and payment_id and signature):
-        return jsonify(error="Missing verification fields."), 400
-    if ORDER_MAP.get(order_id) != token:
-        return jsonify(error="Order-token mismatch."), 400
-    if token not in SESSION_STORE:
-        return jsonify(error="Session expired."), 400
-
-    # Verify signature
-    try:
-        params = {
-            "razorpay_order_id": order_id,
-            "razorpay_payment_id": payment_id,
-            "razorpay_signature": signature
-        }
-        client.utility.verify_payment_signature(params)
-    except Exception as e:
-        return jsonify(error="Signature verification failed."), 400
-
-    # OK
-    return jsonify(ok=True, download_url=f"/download/{token}")
-
-@app.route("/download/<token>")
-def download(token):
-    info = SESSION_STORE.get(token)
-    if not info:
-        return "Session expired or invalid.", 410
-
-    tmpdir = info["dir"]
-    pdf_paths = info["files"]
-    zip_path = os.path.join(tmpdir, "converted_pdfs.zip")
-    if not os.path.exists(zip_path):
-        try:
-            make_zip(pdf_paths, zip_path)
-        except Exception as e:
-            return (f"Zip error: {e}", 500)
 
     @after_this_request
-    def later(resp):
-        # cleanup in 2 minutes
-        cleanup_later(tmpdir, 120)
-        # remove from memory stores
-        try:
-            del SESSION_STORE[token]
-            # remove any order mapping pointing to token
-            for k, v in list(ORDER_MAP.items()):
-                if v == token:
-                    del ORDER_MAP[k]
-        except Exception:
-            pass
+    def cleanup(resp):
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
         return resp
 
-    return send_file(zip_path, as_attachment=True, download_name="converted_pdfs.zip")
+    for f in files:
+        if not f.filename.lower().endswith(".docx"):
+            return "Only .docx allowed", 400
+        total_bytes += f.content_length or 0
+        path = os.path.join(tmpdir, secure_filename(f.filename))
+        f.save(path)
+        saved_paths.append(path)
+
+    total_mb = bytes_to_mb(total_bytes)
+
+    # First pass convert to PDF bytes & count pages
+    pdf_results: List[Tuple[str, bytes]] = []
+    total_pages = 0
+    try:
+        for idx, path in enumerate(saved_paths, 1):
+            html_bytes = docx_to_html_bytes(path)
+            pdf_bytes = html_to_pdf_bytes(html_bytes)
+            pages = count_pdf_pages(pdf_bytes)
+            total_pages += pages
+            base = os.path.splitext(os.path.basename(path))[0]
+            out_name = f"{base}.pdf"
+            pdf_results.append((out_name, pdf_bytes))
+    except Exception as e:
+        return (f"Conversion error: {e}", 500)
+
+    # Enforce limits (unless paid)
+    ok, reason = enforce_free_limits(len(files), total_mb, total_pages, paid_order)
+    if not ok:
+        return jsonify({"error":"payment_required", "reason":reason}), 402
+
+    # Pack into ZIP
+    zip_bytes = make_zip(pdf_results)
+    return send_file(
+        io.BytesIO(zip_bytes),
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name="converted.zip"
+    )
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
