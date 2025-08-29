@@ -3,5 +3,5 @@ gunicorn==23.0.0
 mammoth==1.7.1
 xhtml2pdf==0.2.15
 Pillow==11.3.0
-requests==2.32.5
 pymupdf==1.26.4
+requests==2.32.5
