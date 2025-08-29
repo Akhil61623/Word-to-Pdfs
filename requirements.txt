@@ -5,3 +5,4 @@ xhtml2pdf==0.2.15
 pymupdf==1.26.4
 razorpay==1.4.2
 Pillow==11.3.0
+setuptools>=65.0.0
